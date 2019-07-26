@@ -1,0 +1,25 @@
+{
+  "name": "paper-from-confluence",
+  "version": "1.0.0",
+  "description": "migrate to dropbox paper from atlassian confluence.",
+  "repository": "mimecuvalo/paper-from-confluence",
+  "license": "MIT",
+  "engines": {
+    "node": ">=8.10"
+  },
+  "author": "Mime Čuvalo <mimecuvalo@gmail.com>",
+  "bugs": {
+    "url": "https://github.com/mimecuvalo/paper-from-confluence/issues"
+  },
+  "keywords": [
+    "confluence",
+    "atlassian",
+    "dropbox",
+    "paper",
+    "wiki",
+    "migration"
+  ],
+  "dependencies": {
+    "node-fetch": "2.6.0"
+  }
+}
