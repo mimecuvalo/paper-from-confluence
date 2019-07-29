@@ -100,10 +100,10 @@ async function importDocs() {
   saveState();
 
   const results = common.getResults();
-  if (state.folderMap) {
+  if (!state.folderMap) {
     state.folderMap = {};
   }
-  if (state.docMap) {
+  if (!state.docMap) {
     state.docMap = {};
   }
 
@@ -172,7 +172,7 @@ async function createFolder(name, parent_folder_id, ancestorId) {
   const response = await fetch('https://api.dropboxapi.com/2/paper/folders/create', {
     method: 'POST',
     body: JSON.stringify({
-      name,
+      name: name.replace(/%/g, ''),
       is_team_folder: true,
       parent_folder_id,
     }),
