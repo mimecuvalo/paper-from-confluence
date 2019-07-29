@@ -2,5 +2,7 @@
   "confluence_api_token": "",
   "confluence_email": "",
   "confluence_workspace_name": "",
-  "dropbox_paper_api_token": ""
+  "dropbox_paper_api_token": "",
+  "dropbox_root_folder": "/Users/YOURUSERNAME/Dropbox",
+  "dropbox_attachments_folder": "/Users/YOURUSERNAME/Dropbox/Paper Files/confluence"
 }

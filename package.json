@@ -20,6 +20,7 @@
     "migration"
   ],
   "dependencies": {
+    "mime": "2.4.4",
     "node-fetch": "2.6.0"
   }
 }

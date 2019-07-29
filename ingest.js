@@ -1,53 +1,174 @@
+const common = require('./common');
 const config = require('./config.json');
 const fetch = require('node-fetch');
-const json = require('./data/confluence_00000.json');
+const fs = require('fs');
+const mime = require('mime/lite');
+const path = require('path');
 
-let state = {};
+let state = {
+  stage: 'transferring',
+  attachmentsMap: {},
+  folderMap: {},
+  docMap: {},
+};
 try {
   state = require('./data/state_ingestion.json');
 } catch (ex) {}
 
-const baseUrl = 'https://ohmconnect.atlassian.net/wiki';
-const ancestorsById = {};
+const baseUrl = `https://${config.confluence_workspace_name}.atlassian.net/wiki`;
 
-async function run() {
-  for (const page of json.results) {
-    console.log(page.id,
-        page.title,
-        `${baseUrl}${page._links.webui}`,
-        page.ancestors.length,
-        page.body.view.value.length);
+async function transferAttachments() {
+  state.stage = 'transferring';
+  saveState();
+
+  const attachments = common.getAttachments();
+  console.log(`Moving ${attachments.length} attachments.`);
+
+  for (const attachment of attachments) {
+    const { localPath, dropboxPath, basename } = common.getAttachmentLocalTranslation(attachment);
+    const dirname = path.dirname(dropboxPath);
+    fs.mkdirSync(dirname, { recursive: true });
+    if (!fs.existsSync(localPath) && fs.existsSync(dropboxPath)) {
+      console.log(`Already moved ${basename}, skipping.`)
+      continue;
+    }
+    fs.renameSync(localPath, dropboxPath);
+  }
+
+  state.stage = 'transferring-finished';
+  saveState();
+}
+
+async function getDropboxLinks() {
+  state.stage = 'dropbox-links';
+  saveState();
+
+  if (!state.attachmentsMap) {
+    state.attachmentsMap = {};
+  }
+
+  const response = await fetch('https://api.dropboxapi.com/2/users/get_current_account', {
+    method: 'POST',
+    body: 'null',
+    headers: {
+      Authorization: `Bearer ${config.dropbox_paper_api_token}`,
+      'Content-Type': 'application/json',
+    },
+  });
+  const userInfo = await response.json();
+  const namespaceId = userInfo.root_info.root_namespace_id;
+
+  const attachments = common.getAttachments();
+  console.log(`Getting links for ${attachments.length} attachments.`);
+
+  for (const attachment of attachments) {
+    const { dropboxPath, newBasename } = common.getAttachmentLocalTranslation(attachment);
+    if (state.attachmentsMap[attachment]) {
+      console.log(`Already got link for ${newBasename}, skipping.`);
+      continue;
+    }
+
+    console.log(`Getting link for ${newBasename}.`);
+
+    const response = await fetch('https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings', {
+      method: 'POST',
+      body: JSON.stringify({
+        path: dropboxPath.replace(config.dropbox_root_folder, ''),
+      }),
+      headers: {
+        Authorization: `Bearer ${config.dropbox_paper_api_token}`,
+        'Dropbox-Api-Path-Root': `{".tag": "namespace_id", "namespace_id": "${namespaceId}"}`,
+        'Content-Type': 'application/json',
+      },
+    });
+    const linkInfo = await response.json();
+    const url = linkInfo.url || (linkInfo.error && linkInfo.error.shared_link_already_exists &&
+        linkInfo.error.shared_link_already_exists.metadata.url);
+    state.attachmentsMap[attachment] = {
+      url,
+      dropboxPath: dropboxPath,
+    };
+    saveState();
+  }
+
+  state.stage = 'dropbox-links-finished';
+  saveState();
+}
+
+async function importDocs() {
+  state.stage = 'ingest';
+  saveState();
+
+  const results = common.getResults();
+  if (state.folderMap) {
+    state.folderMap = {};
+  }
+  if (state.docMap) {
+    state.docMap = {};
+  }
+
+  console.log(`Ingesting ${results.length} docs.`);
+
+  for (const page of results) {
+    let view = page.body.view.value;
+
+    // Retrieve attachments
+    view = view.replace(/srcset="[^"]+"/g, '');
+    const otherAttachments = [];
+    for (const attachment of page.children.attachment.results) {
+      const url = `${baseUrl}${attachment._links.download}`;
+      const info = state.attachmentsMap[url];
+      const pathname = new URL(url).pathname;
+      const basename = path.basename(pathname);
+
+      const isImage = mime.getType(basename) && mime.getType(basename).startsWith('image/');
+      if (isImage) {
+        const dropboxUrl = info.url.replace('?dl=0', '?dl=1');
+        view = view.replace(new RegExp(`src="[^"]+${basename}[^"]+"`, 'g'), `src="${dropboxUrl}"`);
+      } else {
+        const dropboxUrl = info.url;
+        otherAttachments.push({ attachment, basename, dropboxUrl } );
+      }
+    }
+    if (page.metadata.labels.results.length) {
+      view += '<h2>Labels</h2><ul>'
+          + page.metadata.labels.results.map(label => `<li>#${label.name}</li>`)
+          + '</ul>';
+    }
+    if (otherAttachments.length) {
+      view += '<h1>Attachments</h1><ul>' + otherAttachments.map(a =>
+        `<li><a href="${a.dropboxUrl}" target="_blank" rel="noopener noreferrer">${a.basename}</a></li>`
+      ) + '</ul>';
+    }
+
+    if (!page.ancestors.length) {
+      page.ancestors = [{ id: 'Unfiled', title: 'Unfiled' }];
+    }
 
     // Create folders (ancestors) if necessary.
     for (let i = 0; i < page.ancestors.length; ++i) {
       const ancestor = page.ancestors[i];
-      console.log('    ', ancestor.id, ancestor.title, `${baseUrl}${ancestor._links.webui}`);
-      if (!ancestorsById[ancestor.id]) {
-        const prevAncestorId = i > 0 ? ancestorsById[page.ancestors[i - 1].id].folder_id : undefined;
-        const newFolder = await createFolder(ancestor.title, prevAncestorId);
-        ancestorsById[ancestor.id] = newFolder;
+      if (!state.folderMap[ancestor.id]) {
+        const prevAncestorId = i > 0 ? state.folderMap[page.ancestors[i - 1].id].folder_id : undefined;
+        await createFolder(ancestor.title, prevAncestorId, ancestor.id);
+      } else {
+        console.log(`\tFound folder ${state.folderMap[ancestor.id].name} already, skipping creation.`);
       }
     }
 
-    // Retrieve attachments
-    for (const attachment of page.children.attachment.results) {
-      const url = `${baseUrl}${attachment._links.download}`;
-      // Download images
-      // Upload to dropbox
-      // Replace url with new url in page content.
-    }
-
     // Create the doc
-    const directAncestorId = ancestorsById[page.id] ? page.id :
+    const directAncestorId = state.folderMap[page.id] ? page.id :
         (page.ancestors[page.ancestors.length - 1] && page.ancestors[page.ancestors.length - 1].id);
-    const paperFolderId = directAncestorId && ancestorsById[directAncestorId].folder_id;
-    const newDoc = await createDoc(page.title, page.body.view.value, paperFolderId);
-    console.log(`created new doc: ${newDoc.doc_id}`);
+    const paperFolderId = directAncestorId && state.folderMap[directAncestorId].folder_id;
+    await createDoc(page.title, view, paperFolderId, page.id);
   }
+
+  state.stage = 'ingest-finished';
+  saveState();
 }
 
-async function createFolder(name, parent_folder_id) {
-  console.log(`creating folder ${name}`);
+async function createFolder(name, parent_folder_id, ancestorId) {
+  console.log(`\tcreating folder ${name}, id:${ancestorId}`);
   const response = await fetch('https://api.dropboxapi.com/2/paper/folders/create', {
     method: 'POST',
     body: JSON.stringify({
@@ -60,11 +181,25 @@ async function createFolder(name, parent_folder_id) {
       'Content-Type': 'application/json',
     },
   });
-  return await response.json();
+
+  const json = await response.json();
+  state.folderMap[ancestorId] = {
+    name,
+    parent_folder_id,
+    folder_id: json.folder_id,
+  };
+  saveState();
+
+  return json;
 }
 
-async function createDoc(name, body, parent_folder_id) {
-  console.log(`creating doc ${name}`);
+async function createDoc(name, body, parent_folder_id, pageId) {
+  if (state.docMap[pageId]) {
+    console.log(`Found doc ${name} already, skipping creation.`);
+    return state.docMap[pageId];
+  }
+
+  console.log(`creating doc ${name}, id:${pageId}`);
   const response = await fetch('https://api.dropboxapi.com/2/paper/docs/create', {
     method: 'POST',
     body: Buffer.from(name + '<br/>' + body),
@@ -74,7 +209,39 @@ async function createDoc(name, body, parent_folder_id) {
       'Dropbox-API-Arg': JSON.stringify({ import_format: 'html', parent_folder_id }),
     },
   });
-  return response.json();
+
+  const json = await response.json();
+  state.docMap[pageId] = {
+    name,
+    parent_folder_id,
+    doc_id: json.doc_id,
+  };
+  saveState();
+  console.log(`created new doc: ${json.doc_id}`);
+
+  return json;
 }
 
+function saveState() {
+  fs.writeFileSync('./data/state_ingestion.json', JSON.stringify(state));
+}
+
+async function run() {
+  if (state.stage === 'transferring') {
+    await transferAttachments();
+  } else {
+    console.log('Already did transfer of attachments, skipping.')
+  }
+  if (state.stage === 'transferring-finished' || state.stage === 'dropbox-links') {
+    await getDropboxLinks();
+  } else {
+    console.log('Already got Dropbox links, skipping.')
+  }
+  if (state.stage === 'dropbox-links-finished' || state.stage === 'ingest') {
+    await importDocs();
+  }
+  if (state.stage === 'ingest-finished') {
+    console.log('Ingestion is finished. (delete ./data/state_ingestion.json to restart.)\n🎉🎉🎉')
+  }
+}
 run();
