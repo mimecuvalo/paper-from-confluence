@@ -10,9 +10,10 @@
   - click "Create API token"
 
 
-3. Setup config:
+3. Setup config and project:
 ```sh
 cp config.json.example config.json
+npm install
 ```
 and then, edit `config.json` with appropriate values.
 

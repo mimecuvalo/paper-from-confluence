@@ -222,6 +222,82 @@ async function createDoc(name, body, parent_folder_id, pageId) {
   return json;
 }
 
+async function docToDocMap() {
+  state.stage = 'doc-to-doc-map';
+  saveState();
+
+  const results = common.getResults();
+
+  console.log(`Mapping ${results.length} docs.`);
+
+  for (const page of results) {
+    let view = page.body.view.value;
+
+    // Retrieve links, if any.
+    const links = view.match(/<a[^>]+pages\/(\d+)[^>]+>.+?<\/a>/g);
+    if (!links) {
+      console.log(`No links found for ${page.id}. Skipping...`);
+      continue;
+    }
+
+    for (const link of links) {
+      const confluenceDocId = link.match(/pages\/(\d+)/)[1];
+      const docInfo = state.docMap[confluenceDocId];
+      if (!docInfo) {
+        console.log(`ERROR: couldn't find ${confluenceDocId}`);
+        continue;
+      }
+
+      view = view.replace(new RegExp(`${escapeRegExp(link)}`, 'g'),
+          `<span class="mention internal">` +
+            `<a class="mention-content mention-pad" data-mentionpadid="${docInfo.doc_id}" ` +
+                `data-mentiontext="${docInfo.name}" href="https://paper.dropbox.com/doc/${docInfo.doc_id}">` +
+              `+<span dir="auto" class="notranslate">${docInfo.name}</span>`+
+            `</a>` +
+          `</span>`);
+    }
+
+    // Update the doc
+    await updateDoc(page.title, view, page.id);
+  }
+
+  state.stage = 'doc-to-doc-map-finished';
+  saveState();
+}
+
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+async function updateDoc(name, body, pageId) {
+  if (state.docMap[pageId].updated) {
+    console.log(`Updated doc ${name} already, skipping updating.`);
+    return state.docMap[pageId];
+  }
+
+  console.log(`updating doc ${name}, id:${pageId}`);
+  const response = await fetch('https://api.dropboxapi.com/2/paper/docs/update', {
+    method: 'POST',
+    body: Buffer.from(name + '<br/>' + body),
+    headers: {
+      Authorization: `Bearer ${config.dropbox_paper_api_token}`,
+      'Content-Type': 'application/octet-stream',
+      'Dropbox-API-Arg': JSON.stringify({
+        doc_id: state.docMap[pageId].doc_id,
+        doc_update_policy: 'overwrite_all',
+        revision: 1,  // This is *probably* correct.
+        import_format: 'html' }),
+    },
+  });
+
+  const json = await response.json();
+  state.docMap[pageId].updated = true;
+  saveState();
+  console.log(`updated doc: ${json.doc_id}`);
+
+  return json;
+}
+
 function saveState() {
   fs.writeFileSync('./data/state_ingestion.json', JSON.stringify(state));
 }
@@ -240,7 +316,10 @@ async function run() {
   if (state.stage === 'dropbox-links-finished' || state.stage === 'ingest') {
     await importDocs();
   }
-  if (state.stage === 'ingest-finished') {
+  if (state.stage === 'ingest-finished' || state.stage === 'doc-to-doc-map') {
+    await docToDocMap();
+  }
+  if (state.stage === 'doc-to-doc-map-finished') {
     console.log('Ingestion is finished. (delete ./data/state_ingestion.json to restart.)\n🎉🎉🎉')
   }
 }
